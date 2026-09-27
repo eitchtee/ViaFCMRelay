@@ -10,3 +10,4 @@ docs
 .ruff_cache
 *.md
 !README.md
+service-account*.json

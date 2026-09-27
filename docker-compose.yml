@@ -1,0 +1,28 @@
+# Via FCM relay. Needs the Firebase service account key of the project the Via Android app
+# is built with (Firebase console > Project settings > Service accounts > Generate new key).
+# Save it as service-account.json next to this file, then:
+#
+#   docker compose up -d
+#
+# Tags: latest (newest release), vX.Y.Z (a release), nightly (main, may be unstable).
+# To build from a source checkout instead, comment out `image:` and uncomment `build: .`.
+
+services:
+  relay:
+    image: ghcr.io/eitchtee/viafcmrelay:latest
+    # build: .
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    volumes:
+      - ./service-account.json:/run/secrets/fcm.json:ro
+    environment:
+      VIA_RELAY_CREDENTIALS_FILE: /run/secrets/fcm.json
+      # Behind a reverse proxy, trust its X-Forwarded-For so per-IP limits see real callers.
+      # Only do this when callers can't reach the relay directly (remove `ports` above), or
+      # anyone could fake the header and get unlimited wakes. Use the proxy's address, or "*"
+      # when the proxy is the only thing that can reach the relay:
+      # VIA_RELAY_FORWARDED_ALLOW_IPS: "*"
+      # VIA_RELAY_IP_RATE_PER_MINUTE: 60
+      # VIA_RELAY_IP_DAILY_LIMIT: 5000
+      # VIA_RELAY_INSTANCE_KEYS: key1,key2

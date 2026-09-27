@@ -1,0 +1,146 @@
+# Builds and publishes the Via FCM relay image to GitHub Container Registry.
+#
+#   release published   -> :<release tag>, plus :latest if it is the repository's latest release
+#   manual run          -> builds a branch or tag; image tag is the custom tag if given, else the
+#                          ref name; plus :latest only when building the latest release's tag
+#   push to main        -> :nightly (newer commits cancel older, still-running builds)
+
+name: Docker image
+
+on:
+  release:
+    types: [published]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or release tag to build
+        required: true
+        default: main
+      tag:
+        description: Custom image tag (optional; defaults to the branch or tag name)
+        required: false
+        default: ""
+
+# Nightly builds share one group, so a newer commit on main cancels the running build.
+# Release and manual builds each get their own group and always run to completion.
+concurrency:
+  group: ${{ github.event_name == 'push' && 'docker-nightly' || format('docker-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Decide what to build and how to tag it
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          # A valid Docker tag: [A-Za-z0-9_.-], at most 128 chars, not starting with . or -.
+          valid_tag() { [[ "$1" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; }
+          # Branch names like feature/x become feature-x.
+          sanitize() {
+            local t
+            t=$(printf '%s' "$1" | tr -c 'A-Za-z0-9_.-' '-' | sed -E 's/^[.-]+//')
+            printf '%s' "${t:0:128}"
+          }
+
+          # Tag of the repository's latest release ("" when there are no releases).
+          # GitHub never marks drafts or pre-releases as latest.
+          latest_release=$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name 2>/dev/null || true)
+
+          case "$EVENT" in
+            push)
+              ref="$GITHUB_SHA"
+              tags=(nightly)
+              ;;
+            release)
+              ref="$RELEASE_TAG"
+              valid_tag "$RELEASE_TAG" || { echo "::error::Release tag '$RELEASE_TAG' is not a valid image tag"; exit 1; }
+              tags=("$RELEASE_TAG")
+              [[ -n "$latest_release" && "$RELEASE_TAG" == "$latest_release" ]] && tags+=(latest)
+              ;;
+            workflow_dispatch)
+              ref="$INPUT_REF"
+              if [[ -n "$INPUT_TAG" ]]; then
+                valid_tag "$INPUT_TAG" || { echo "::error::'$INPUT_TAG' is not a valid image tag"; exit 1; }
+                case "$INPUT_TAG" in
+                  latest|nightly) echo "::error::'$INPUT_TAG' is managed by this workflow; pick another tag"; exit 1 ;;
+                esac
+                tags=("$INPUT_TAG")
+              else
+                tags=("$(sanitize "$INPUT_REF")")
+              fi
+              [[ -n "$latest_release" && "$INPUT_REF" == "$latest_release" ]] && tags+=(latest)
+              ;;
+            *)
+              echo "::error::Unexpected event $EVENT"; exit 1 ;;
+          esac
+
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          {
+            echo "ref=$ref"
+            echo "image=$image"
+            echo "tags<<EOF"
+            for t in "${tags[@]}"; do echo "type=raw,value=$t"; done
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Building $ref as ${tags[*]} (latest release: ${latest_release:-none})"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.plan.outputs.ref }}
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.plan.outputs.image }}
+          tags: ${{ steps.plan.outputs.tags }}
+          flavor: latest=false  # :latest is decided above, never implicitly
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          REF: ${{ steps.plan.outputs.ref }}
+        run: |
+          {
+            echo "### Published image"
+            echo
+            echo "Built from \`$REF\` (\`$(git rev-parse --short HEAD)\`), digest \`$DIGEST\`"
+            echo
+            while read -r tag; do echo "- \`$tag\`"; done <<< "$TAGS"
+          } >> "$GITHUB_STEP_SUMMARY"
